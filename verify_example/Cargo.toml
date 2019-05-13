@@ -7,3 +7,4 @@ edition = "2018"
 [dependencies]
 failure = "0.1.5"
 sequoia-openpgp = "0.7.0"
+serde_json = "1.0.39"
