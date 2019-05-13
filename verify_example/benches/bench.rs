@@ -23,6 +23,11 @@ fn bench_nacl_load_key(b: &mut Bencher) {
 }
 
 #[bench]
+fn bench_parse_kbsig(b: &mut Bencher) {
+    b.iter(|| verify_example::parse_kbsig(verify_example::ROOT_5360668_KBSIG).unwrap());
+}
+
+#[bench]
 fn bench_nacl_verify_merkle_root(b: &mut Bencher) {
     let key = verify_example::load_nacl_key(verify_example::ROOT_NACL_KEY).unwrap();
     b.iter(|| verify_example::verify_kbsig(verify_example::ROOT_5360668_KBSIG, &key).unwrap());

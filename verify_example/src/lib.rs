@@ -101,12 +101,12 @@ pub fn load_nacl_key(kid: &str) -> Result<sodiumoxide::crypto::sign::PublicKey, 
 }
 
 #[derive(Debug, Deserialize)]
-struct KBSig {
+pub struct KBSig {
     body: KBSigBody,
 }
 
 #[derive(Debug, Deserialize)]
-struct KBSigBody {
+pub struct KBSigBody {
     // Without these bytes annotations, serde will assume Vec<u8> is an array
     // of its, rather than the msgpack bytes type.
     #[serde(with = "serde_bytes")]
@@ -115,14 +115,17 @@ struct KBSigBody {
     payload: Vec<u8>,
 }
 
+pub fn parse_kbsig(base64_sig: &str) -> Result<KBSig, Error> {
+    let bytes = base64::decode(base64_sig)?;
+    let kbsig = rmp_serde::decode::from_slice(&bytes)?;
+    Ok(kbsig)
+}
+
 pub fn verify_kbsig(
-    signed_message: &str,
+    base64_sig: &str,
     key: &sodiumoxide::crypto::sign::PublicKey,
 ) -> Result<Vec<u8>, Error> {
-    let bytes = base64::decode(signed_message)?;
-    // let v: rmpv::Value = rmpv::decode::read_value(&mut &*bytes).unwrap();
-    // dbg!(v);
-    let obj: KBSig = rmp_serde::decode::from_slice(&bytes)?;
+    let obj = parse_kbsig(base64_sig)?;
     let sig = sodiumoxide::crypto::sign::Signature::from_slice(&obj.body.sig)
         .ok_or(err_msg("bad sig length"))?;
     if !sodiumoxide::crypto::sign::verify_detached(&sig, &obj.body.payload, key) {
