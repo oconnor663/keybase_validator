@@ -8,6 +8,14 @@ use sequoia_openpgp::parse::{PacketParser, Parse};
 use sequoia_openpgp::{KeyID, TPK};
 use std::io;
 
+pub static JACK_KEY: &str = include_str!("jack_key.pgp");
+pub static ROOT_KEY: &str = include_str!("root_key.pgp");
+pub static ROOT_5360668_PGP: &str = include_str!("root_5360668.pgp");
+pub static ROOT_5360668_JSON: &str = include_str!("root_5360668.json");
+
+const BAD_SIG: &str = "Bad signature";
+const MISSING_KEY: &str = "Missing key to verify signature";
+
 pub fn load_key(key: &[u8]) -> sequoia_openpgp::Result<TPK> {
     let parser_result = PacketParser::from_bytes(key)?;
     TPK::from_packet_parser(parser_result)
@@ -54,10 +62,10 @@ impl<'a> VerificationHelper for Helper<'a> {
                     match results.get(0) {
                         Some(VerificationResult::GoodChecksum(..)) => good = true,
                         Some(VerificationResult::MissingKey(_)) => {
-                            return Err(failure::err_msg("Missing key to verify signature"))
+                            return Err(failure::err_msg(MISSING_KEY))
                         }
                         Some(VerificationResult::BadChecksum(_)) => {
-                            return Err(failure::err_msg("Bad signature"))
+                            return Err(failure::err_msg(BAD_SIG))
                         }
                         None => return Err(failure::err_msg("No signature")),
                     }
@@ -74,12 +82,32 @@ impl<'a> VerificationHelper for Helper<'a> {
     }
 }
 
-#[test]
-fn verify_merkle_root() -> sequoia_openpgp::Result<()> {
-    static ROOT_KEY: &str = include_str!("root_key.pgp");
-    static ROOT_5360668: &str = include_str!("root_5360668.pgp");
-    let key = load_key(ROOT_KEY.as_bytes())?;
-    let output = verify(ROOT_5360668.as_bytes(), &key)?;
-    println!("verified message:\n\n{}", String::from_utf8_lossy(&output));
-    Ok(())
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_verify_merkle_root() {
+        let key = load_key(ROOT_KEY.as_bytes()).unwrap();
+        let output = verify(ROOT_5360668_PGP.as_bytes(), &key).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+        assert_eq!(ROOT_5360668_JSON, output_str);
+    }
+
+    #[test]
+    fn test_wrong_key_fails() {
+        let key = load_key(JACK_KEY.as_bytes()).unwrap();
+        let err = verify(ROOT_5360668_PGP.as_bytes(), &key).unwrap_err();
+        assert_eq!(err.to_string(), MISSING_KEY);
+    }
+
+    #[test]
+    fn test_corrupt_sig_fails() {
+        let key = load_key(ROOT_KEY.as_bytes()).unwrap();
+        let mut corrupt_sig = ROOT_5360668_PGP.as_bytes().to_vec();
+        let middle = corrupt_sig.len() / 2;
+        corrupt_sig[middle] ^= 1;
+        let err = verify(&corrupt_sig, &key).unwrap_err();
+        assert_eq!(err.to_string(), MISSING_KEY);
+    }
 }
