@@ -4,15 +4,15 @@
 
 The validator will store everything in a SQL database. Development will use a
 SQLite file, and it's expected that most production deployments will too.
-However, the design will try to make it relatively easy to add MySQL/Postgres
-support later.
+However, the implementation will try to make it relatively easy to add
+MySQL/Postgres support later.
 
-## Unstructured data
+## Isolated objects and their properties
 
-These items can be ingested from dump files or over a firehose to bootstrap the
-local database.
+These items can be ingested from dump files or over a firehose connection to
+bootstrap the local database. In general they're all identified by their hash.
 
-- merkle tree nodes
+- merkle tree roots, nodes, and leaves
 - sigchain links (user, team)
 - PGP key bodies
 
@@ -23,19 +23,30 @@ ingestion. For example:
 - PGP keys have the KID that they're supposed to
 - merkle tree roots are signed by a Keybase root key
 - merkle tree roots contain the skip pointers that they're supposed to
-- sigchain links are signed by the key they say they're signed by
+- sigchain links are signed by the key they claim
 
-## Structured data
+Once an object is stored in the local DB, these properties are assumed to be
+verified. This is potentially important for perfomance, for example if
+signature verification occasionally requires shelling out to GPG or doing some
+kind of RPC. Most operations in the steady state should be incremental,
+operating on only a small number of objects, such that object loading doesn't
+necessarily need to be optimized. However, it will occasionally be necessary to
+re-verify large parts of the world, for example when an new version of the
+validator adds a new rule. Avoiding shelling out thousands of times in that
+case could be important.
+
+## Global consistency
 
 Unlike the properties above, which can be checked looking at a single object
 (or maybe a pair of objects) in isolation, there are other properties that we
 can only validate by looking at the whole world:
 
-- the merkle root sequence is contiguous, with no duplicates
-- every merkle prev pointer agrees about the hash of the root at a given seqno
+- the merkle root sequence numbers are contiguous
+- every merkle prev pointer has the correct hash
 - no merkle root rewinds or forks any user or team
-- user and team sigchains are contiguous
-- each signing key in a user or team's sigchain was valid at the time it was used
+- user and team sigchains sequence numbers are contiguous
+- each signing key in a user or team's sigchain was valid at the time it was
+  used
 
 ## Adding new checks over time
 
