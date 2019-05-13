@@ -101,13 +101,5 @@ mod test {
         assert_eq!(err.to_string(), MISSING_KEY);
     }
 
-    #[test]
-    fn test_corrupt_sig_fails() {
-        let key = load_key(ROOT_KEY.as_bytes()).unwrap();
-        let mut corrupt_sig = ROOT_5360668_PGP.as_bytes().to_vec();
-        let middle = corrupt_sig.len() / 2;
-        corrupt_sig[middle] ^= 1;
-        let err = verify(&corrupt_sig, &key).unwrap_err();
-        assert_eq!(err.to_string(), MISSING_KEY);
-    }
+    // TODO: Produce a corrupt signature with a valid CRC and check that.
 }
