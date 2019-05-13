@@ -1,0 +1,9 @@
+[package]
+name = "verify_example"
+version = "0.1.0"
+authors = ["Jack O'Connor <oconnor663@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+failure = "0.1.5"
+sequoia-openpgp = "0.7.0"
