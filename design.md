@@ -33,18 +33,20 @@ the local tree, and every user update has been verified. If any step fails
 verification, the process flips into a global failure state, from which it
 doesn't attempt to recover.
 
-Clients query the validator by sending along the last signed merkle root they
-saw from keybase.io. If the root they send has a valid signature, and the
-validator hasn't yet seen it, this will kick off a run of the root loop to
-catch up and wait for it to complete. The validator will also record every
-signed merkle root that it encounters, and any inconsistencies will lead to
-another permanent failure state, making these requests a sort of gossip
-protocol about what each client is seeing.
+In this design, the API of the validator is a single REST endpoint. Clients
+query the validator by sending along the last signed merkle root they saw from
+keybase.io. If the root they send has a valid signature, and the validator
+hasn't yet seen it, this will kick off a run of the root loop to catch up and
+wait for it to complete. The validator will also record every signed merkle
+root that it encounters, and any inconsistencies will lead to another permanent
+failure state, making these requests a sort of gossip protocol about what each
+client is seeing. After the root loop catches up to the request, if everything
+went smoothly, the API call returns success.
 
 If the validator sees any errors during the root loop, it fails the client
 request that started it (if any) and all subsequent requests. The request may
-also fail with a "not yet in the steady state" error if the validator hasn't
-yet completed its first bootstrapping runs through root loop.
+also fail with a "not yet bootstrapped" error if the validator hasn't yet
+completed its first bootstrapping runs through root loop.
 
 ## Caching
 
@@ -65,7 +67,8 @@ cache everything:
   for a user. But there's no reason to refetch merkle roots or sigchain links
   in that case, because their contents are immutable. That sort of refetching
   could also become a thundering herd problem, if there are many copies of the
-  validator running in the wild.
+  validator running in the wild. More on this approach in its own section
+  below.
 - Development. Much of development will be repeatedly re-running the validator
   against production Merkle tree data, and gradually encountering all the
   corner cases that have come up over time. Avoiding network fetches during
@@ -74,7 +77,7 @@ cache everything:
 The following items will be cached in raw tables, which should never need to be
 modified:
 
-- Merkle roots, indexed by their seqno.
+- Merkle root sigs, indexed by their seqno.
 - Merkle interior nodes, indexed by their hash.
 - User sigchain links, indexed by their UID and seqno.
 - User PGP keys, indexed by their derived KID and `full_hash`.
@@ -83,11 +86,14 @@ Other derived data will be cached in separate tables, with the expectation that
 these tables can be blown away during a version upgrade if need be. For
 example:
 
-- The "current" Merkle seqno. (With respect to either the current steady state
-  of the validator, or the intermediate state of a root loop in progress.)
+- The verified plaintext extracted from raw signatures.
+- The "current" Merkle seqno, with respect to either the current steady state
+  of the validator, or the intermediate state of the root loop in progress.
+  This is a singleton.
 - The current seqno for each user sigchain.
 - The set of active sibkeys (and their PGP full hashes) for each user.
 - The set of all pinned KIDs, and the users that have pinned them.
+- The global UID <-> username mapping.
 
 ## Bootstrapping and Performance
 
@@ -105,9 +111,9 @@ bench_pgp_load_key            609,595 ns/iter (+/- 7,997)
 bench_pgp_verify_merkle_root  277,699 ns/iter (+/- 1,827)
 ```
 
-Loading a PGP key (the merkle root signing key) and checking a signature take
-1ms combined. For comparison, `curl https://keyase.io/robots.txt` takes about
-100ms.
+Loading a PGP key (the merkle root signing key in this measurement) and
+checking a signature take 1ms combined. For comparison, `curl
+https://keyase.io/robots.txt` takes about 100ms.
 
 This lets us make some important back-of-the-envelope estimates about
 performance requirements. The current merkle seqno as of this writing (14 May
@@ -115,37 +121,38 @@ performance requirements. The current merkle seqno as of this writing (14 May
 validating every one of those roots requires a single 100ms network fetch and
 nothing else, bootstrapping will take 6 days. If validating every one of those
 roots requires verifying a single PGP signature and nothing else, bootstrapping
-will take 2 hours. (However note that with some effort, signature verification
-could be parallelize across many cores, if that ends up being the bottleneck.)
+will take 2 hours. However note that with some effort, signature verification
+could be parallelize across many cores; more on parallelism below.
 
 Choosing a performance target is somewhat arbitrary, but my preference is for
 bootstrapping to finish "overnight", or in at most 8 hours. That works out to
 about 5ms per merkle seqno. It will be impossible to hit that target without
 doing network batching to reduce round trips.
 
-Some of that can be done today: Fetching a user's entire set of keys can be
-done all at once. Likewise fetching a user's entire set of sigchain nodes.
-However, I don't think there's currently an appropriate endpoint for batching
-fetches of the entire merkle tree. The behavior would need to be of the form:
-"Given a last seen merkle seqno S1, and a requested seqno S2, send me every
-merkle root S1 < S <= S2, along with every interior node present in all of
-those trees but not in S1." The API server will need to add this endpoint.
+Some of that batching can be done with the Keybase API today: Fetching a user's
+entire set of keys can be done all at once. Likewise fetching a user's entire
+set of sigchain nodes. However, I don't think there's currently an appropriate
+endpoint for batching fetches of the entire merkle tree. The behavior would
+need to be of the form: "Given a last seen merkle seqno S1, and a requested
+seqno S2, send me every merkle root S1 < S <= S2, along with every interior
+node present in all of those trees but not in S1." The API server will need to
+add that endpoint.
 
-This endpoint would get rid of the network round trip penalty for fetching
-merkle tree nodes, if the validator fetched them in batches of 10 or
-100. However, it's likely that the keybase.io API server will still pay a
-MySQL/Aurora round trip penalty for each node in assembling the response. I
-haven't measured Keybase's MySQL round trip time, but I expect it to be between
-1ms and 10ms. (Max: Do you know our median response time?) Even if a MySQL
-fetch takes only 1ms per merkle tree node, we would probably burn up our entire
-5ms per-root-node time budget just fetching the interior nodes.
+That endpoint would get rid of the network round trip penalty for fetching
+merkle tree nodes, if the validator fetched them in groups. However, it's
+likely that the keybase.io API server will still pay a MySQL/Aurora round trip
+penalty for each node in assembling the response. I haven't measured Keybase's
+MySQL round trip time, but I expect it to be between 1ms and 10ms. (Max: Do you
+know our median response time?) Even if a MySQL fetch takes only 1ms per merkle
+tree node, we would probably burn up our entire 5ms per-root-node time budget
+just fetching the interior nodes.
 
 So while the batch merkle tree fetching endpoint is an important part of
 reducing overhead in the steady state, it's likely that it won't be fast enough
 to hit our performance target for boostrapping. Instead, Keybase will need to
 publish large dump files containing all the merkle nodes in the world, and the
 validator will need to download and process these files as part of
-bootstrapping. More discussion of this design below.
+bootstrapping. More discussion of this design below in its own section.
 
 ## Properties to Validate
 
@@ -173,20 +180,11 @@ My plan is to get an MVP working for those properties, and then to flesh out
 the properties for teams afterwards, since I understand those less well. (Max:
 Thoughts about that?)
 
-- naive loop
-- list of exact things to be verified
-- bootstrapping optimizations
-- updates (throwing away some caches, feature flags)
-- blockchain integration
-- team tree verification
-- parallelism optimizations
-- in-the-hot-path queries
-
 ## Local Storage
 
-The validator will store everything in a SQL database. Development will use a
-SQLite file, and it's expected that most production deployments will too.
-However, the implementation will try to make it relatively easy to add
+The validator will store everything it caches in a SQL database. Development
+will use a SQLite file, and it's expected that most production deployments will
+too. However, the implementation will try to make it relatively easy to add
 MySQL/Postgres support later.
 
 Note that one of the implementation details we'll need to track carefully for
@@ -210,27 +208,27 @@ to walk through all the currently known users and specifically re-check their
 PGP signatures, without dropping any data. However, this strategy could miss a
 tricky interaction with teams, where we also need to check that any team
 signature made with a PGP key used the right version, relative to what that
-user had active at the time. (If I recall, PGP keys aren't allowed to make team
-sigs, but I'm running with this just as an example.) Normally the root loop
-manages a consistent picture of the entire world at a given time, but here the
-version upgrade code would be looking back in time and trying to recreate that
-picture. This sort of version-jump-specific code is complicated to get right,
-duplicative of the logic in the root loop, and unlikely to be tested thoroughly
-or maintained carefully.
+user had active at the time. (If I recall, PGP keys actually aren't allowed to
+make team sigs, but I'm running with this just as an example.) Normally the
+root loop manages a consistent picture of the entire world at a given time, but
+here the version upgrade code would be looking back in time and trying to
+recreate that picture. This sort of version-jump-specific code is complicated
+to get right, duplicative of the logic in the root loop, and unlikely to be
+tested thoroughly or maintained carefully.
 
-Instead, I expect that the implementation will tend to drop all of the derived
-data from the previous version, and to repeat the root loop in its entirety.
-This is potentially much more expensive, but importantly it means that there's
-only one codepath for validating things. As noted above, caching can
-substantially reduce the cost of doing this.
+Instead, I expect that the implementation will tend to drop much or all of the
+derived data from the previous version, and to repeat the root loop in its
+entirety from seqno 1. This is potentially much more expensive, but importantly
+it means that there's only one codepath for validating things. As noted above,
+caching can substantially reduce the cost of doing this.
 
 Installations that can't tolerate validator downtime (for example, if we let
 people put the validator in the hot path of their client requests) might need a
 workflow that involves spinning up a new instance in parallel with the old one,
-waiting for the new instance to bootstrap, and then swapping the two instances.
-This would probably be the case even if we tried to retain as much data across
-versions as possible, because e.g. re-verifying large parts of the world is
-always going to take a long time, even if it doesn't take 8 hours.
+waiting for the new instance to bootstrap, and then swapping the two instances
+at the DNS level. This would probably be the case even if we tried to retain as
+much data across versions as possible, because e.g. re-verifying large parts of
+the world is always going to take a long time, even if it doesn't take 8 hours.
 
 ## Dealing with PGP
 
@@ -248,7 +246,7 @@ minority, it might be much simpler to shell out than to try to support every
 corner case. A likely strategy here will be to attempt validation with Sequoia,
 and when that fails, to automatically make a fallback attempt with GnuPG.
 
-We will probably want to cache signatures in two forms:
+As noted above, we will probably want to cache signatures in two forms:
 
 - The "raw" tables mentioned above, which include signature in the attached
   form indexed by seqno.
@@ -257,12 +255,63 @@ We will probably want to cache signatures in two forms:
 
 The verified tables will represent derived data, but that data is unlikely to
 ever be dropped, because signature verification is very stable. This will
-roughly double the overall storage requirements of the validator however.
+roughly double the overall storage requirements of the validator, however,
+compared to storing only the raw sigs.
 
 One wrinkle for user PGP sigs: The state of the user's sigchain determines what
-`full_hash` version of the key should be used to check a signature. In
-particular, this isn't local to the sigchain link in question; it's a matter of
-looking back in the sigchain. One workaround here could be to store the
-`full_hash` that was used to validate a signature, and to repeat the validation
-later if it ever looks like that `full_hash` that was used in the past doesn't
-match what's needed.
+`full_hash` version of the key should be used to check a signature. If sigchain
+links are always ingested in order, we could try to keep track of full hashes,
+but there's a risk that different versions of the validator might disagree
+about which version of the full hash applied. One workaround here could be to
+store the `full_hash` that was used to validate a signature as a column in the
+verified table, and to repeat the validation later if it ever looks like that
+`full_hash` that was used in the past doesn't match what's expected.
+
+## Dump Files
+
+As noted above in the performance discussion, bulk dump files will probably be
+the most important step in improving bootstrapping performance. At a minimum,
+these will need to supply all the merkle tree interior nodes in the world.
+Dumping the interior nodes as a class will allow MySQL to execute a giant table
+scan, avoiding the round trip penalties that the Keybase API server pays for
+tree traversals.
+
+The dump file might also include root nodes, since I'm not sure a bulk root
+node fetching endpoint exists now, but alternatively such an endpoint could be
+added. Likewise the dump file could include user keys and sigs, but the
+existing API endpoints for fetching those in bulk are probably adequate.
+
+The dump file could be regenerated periodically, say once a week. If the query
+turns out to put an unacceptable load on the production DB, it could instead be
+generated from a replica. Only the most recent dump file needs to be kept
+around on the server, so storage requirements don't need to grow quadratically
+over time. Alternatively, the server could generate e.g. one dump file per day,
+including only the interior nodes generated that day, and the client could do a
+separate fetch for each day. (However, I don't think interior nodes record what
+day they were created on, so executing daily dumps without an expensive tree
+traversal might require some new indexes on the server side.)
+
+Ideally neither the database, nor the API server, nor the validator will need
+to keep the entire world of merkle iterior nodes in memory at any point.
+Formatting the whole thing as e.g. a giant JSON list of strings would make that
+tricky, because iterating over a JSON list in a streaming fashion is
+troublesome. A series of concatenated JSON blobs, or MessagePack blobs, or
+something like that would probably be easier to work with. But the details
+aren't super important here.
+
+## Parallelism
+
+The initial implementation of the validator will be single-threaded, and runtime is going to be dominated by IO at first.
+
+## Blockchain
+
+- naive loop
+- list of exact things to be verified
+- bootstrapping optimizations
+- updates (throwing away some caches, feature flags)
+- blockchain integration
+- team tree verification
+- parallelism optimizations
+- in-the-hot-path queries
+- contract estimates
+- dump files
