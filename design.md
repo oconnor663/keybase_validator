@@ -91,7 +91,7 @@ example:
 
 ## Bootstrapping and Performance
 
-I've tested PGP and Keybase-flavored-NACL signature verification in Rust and
+I've tested PGP and Keybase-flavored-NaCl signature verification in Rust and
 put together a [small benchmark
 suite](https://github.com/oconnor663/keybase_validator/blob/master/verify_example/benches/bench.rs).
 Here are the results from my laptop (`cargo +nightly bench`):
@@ -125,17 +125,14 @@ doing network batching to reduce round trips.
 
 Some of that can be done today: Fetching a user's entire set of keys can be
 done all at once. Likewise fetching a user's entire set of sigchain nodes.
-Doing those operations the first time a user is encountered will substantially
-reduce roundtrips.
-
 However, I don't think there's currently an appropriate endpoint for batching
 fetches of the entire merkle tree. The behavior would need to be of the form:
 "Given a last seen merkle seqno S1, and a requested seqno S2, send me every
 merkle root S1 < S <= S2, along with every interior node present in all of
-those trees but not in S1."
+those trees but not in S1." The API server will need to add this endpoint.
 
-An endpoint like that would get rid of the network round trip penalty for
-fetching merkle tree nodes, if the validator fetched them in batches of 10 or
+This endpoint would get rid of the network round trip penalty for fetching
+merkle tree nodes, if the validator fetched them in batches of 10 or
 100. However, it's likely that the keybase.io API server will still pay a
 MySQL/Aurora round trip penalty for each node in assembling the response. I
 haven't measured Keybase's MySQL round trip time, but I expect it to be between
@@ -143,33 +140,38 @@ haven't measured Keybase's MySQL round trip time, but I expect it to be between
 fetch takes only 1ms per merkle tree node, we would probably burn up our entire
 5ms per-root-node time budget just fetching the interior nodes.
 
-So while that batch endpoint is probably an important step to reduce overhead
-in the steady state, it's likely that it won't be fast enough to hit our
-performance target for boostrapping. Instead, Keybase will need to publish
-large dump files containing all the merkle nodes in the world, and the
+So while the batch merkle tree fetching endpoint is an important part of
+reducing overhead in the steady state, it's likely that it won't be fast enough
+to hit our performance target for boostrapping. Instead, Keybase will need to
+publish large dump files containing all the merkle nodes in the world, and the
 validator will need to download and process these files as part of
 bootstrapping. More discussion of this design below.
 
-### Bootstrapping
+## Properties to Validate
 
-Bootstrapping a validator up from an empty state will be dominated by network
-overhead, but there are several ways that overhead could be reduced:
+This is an initial list off the top of my head, and we'll need to add to it as
+we think of other properties.
 
-- The keybase.io API could provide a streaming endpoint for reads. That would
-  reduce the round trips associated with each fetch. Alternatively, we could
-  support HTTP2 and let that reduce the overhead for us.
-- Keybase could export periodic dump files containing all the raw objects that
-  the validator needs. Those could be hosted in e.g. a large Amazon S3 bucket.
+Tree-specific:
+- Each merkle root is validly signed.
+- Merkle root seqnos are a contiguous series, with no duplicates.
+- Each root contains the appropriate prev pointer and skip pointers, each with
+  the right hash.
 
-The former would probably end up putting a lot of strain on the API server
-itself, so my preference would be for the latter. A new validator could
-automatically download one of these dump files during startup. The dump files
-could also be designed in a streaming or chunked fashion, so that processing
-can happen in parallel with fetching, and so that an interrupted bootstrapping
-could resume where it left off.
+User-specific:
+- No merkle root ever moves a user seqno backwards.
+- User seqnos are a contiguous series, with no duplicates.
+- Each sigchain link contins the appropriate prev pointer, with the right
+  hash.
+- Each sigchain link is signed by a key that was active at the time (respecting
+  the PGP `full_hash` field when present).
+- No two users own the same KID ("key pinning").
+- The mapping of usernames to UIDs is unique. (We could enforce the fact that
+  most UIDs are the hash of a username, or that might not be necessary.)
 
-The exact layout of dump files will be easier to design when we have a working
-validator and we can profile the hotspots in the bootstrapping process. We'll also have a better estimate of whether 
+My plan is to get an MVP working for those properties, and then to flesh out
+the properties for teams afterwards, since I understand those less well. (Max:
+Thoughts about that?)
 
 - naive loop
 - list of exact things to be verified
@@ -180,76 +182,87 @@ validator and we can profile the hotspots in the bootstrapping process. We'll al
 - parallelism optimizations
 - in-the-hot-path queries
 
-## Storage
+## Local Storage
 
 The validator will store everything in a SQL database. Development will use a
 SQLite file, and it's expected that most production deployments will too.
 However, the implementation will try to make it relatively easy to add
 MySQL/Postgres support later.
 
-## Isolated objects and their properties
+Note that one of the implementation details we'll need to track carefully for
+SQLite is when to run [`ANALYZE`](https://sqlite.org/lang_analyze.html). SQLite
+doesn't automatically update its own query planning metadata, and the caller is
+responsible for triggering analytics periodically. We'll certainly need to run
+that after the initial bootstrapping loop, and we might want to run it after
+any bulk insert (like if the validator went offline for a few days). I'll need
+to experiment with this.
 
-These items can be ingested from dump files or over a firehose connection to
-bootstrap the local database. In general they're all identified by their hash.
+## Adding New Checks in Future Versions
 
-- merkle tree roots, nodes, and leaves
-- sigchain links (user, team)
-- PGP key bodies
+The database will record what version of the validator created it. When the
+validator starts up, and sees that its database was created by an older
+version, it may decide to drop data.
 
-Everything that can be validated about an object in isolation is checked during
-ingestion. For example:
+For example, it might be that version 1 validated PGP signatures loosely,
+without respecting the `full_hash` field. Version 2 understands that field, and
+it knows that all user sigchains need to be re-validated. One option would be
+to walk through all the currently known users and specifically re-check their
+PGP signatures, without dropping any data. However, this strategy could miss a
+tricky interaction with teams, where we also need to check that any team
+signature made with a PGP key used the right version, relative to what that
+user had active at the time. (If I recall, PGP keys aren't allowed to make team
+sigs, but I'm running with this just as an example.) Normally the root loop
+manages a consistent picture of the entire world at a given time, but here the
+version upgrade code would be looking back in time and trying to recreate that
+picture. This sort of version-jump-specific code is complicated to get right,
+duplicative of the logic in the root loop, and unlikely to be tested thoroughly
+or maintained carefully.
 
-- objects parse successfully and have the required fields
-- PGP keys have the KID that they're supposed to
-- merkle tree roots are signed by a Keybase root key
-- merkle tree roots contain the skip pointers that they're supposed to
-- sigchain links are signed by the key they claim
+Instead, I expect that the implementation will tend to drop all of the derived
+data from the previous version, and to repeat the root loop in its entirety.
+This is potentially much more expensive, but importantly it means that there's
+only one codepath for validating things. As noted above, caching can
+substantially reduce the cost of doing this.
 
-Once an object is stored in the local DB, these properties are assumed to be
-verified. This is potentially important for perfomance, for example if
-signature verification occasionally requires shelling out to GPG or doing some
-kind of RPC. Most operations in the steady state should be incremental,
-operating on only a small number of objects, such that object loading doesn't
-necessarily need to be optimized. However, it will occasionally be necessary to
-re-verify large parts of the world, for example when an new version of the
-validator adds a new rule. Avoiding shelling out thousands of times in that
-case could be important.
-
-## Global consistency
-
-Unlike the properties above, which can be checked looking at a single object
-(or maybe a pair of objects) in isolation, there are other properties that we
-can only validate by looking at the whole world:
-
-- the merkle root sequence numbers are contiguous
-- every merkle prev pointer has the correct hash
-- no merkle root rewinds or forks any user or team
-- user and team sigchains sequence numbers are contiguous
-- each signing key in a user or team's sigchain was valid at the time it was
-  used
-
-## Adding new checks over time
-
-A "finshed checks" table will store a list of properties that have been
-validated about either individual objects or about the entire world. During
-boot, the validator loads all the entries in that table, and performs any
-checks that it knows about that are missing from the list. The goal is that
-future versions of the validator can add a new property (e.g. "prev sig ID and
-prev sig payload hash hash must match"), and after updating a given
-installation, the new version of the validator will perform the new check on
-all its existing cached data, and record success in the DB (or switch into the
-"world is on fire" state). Checking a property across the entire world is
-expensive, and it's important that the validator doesn't pay those costs during
-every boot.
+Installations that can't tolerate validator downtime (for example, if we let
+people put the validator in the hot path of their client requests) might need a
+workflow that involves spinning up a new instance in parallel with the old one,
+waiting for the new instance to bootstrap, and then swapping the two instances.
+This would probably be the case even if we tried to retain as much data across
+versions as possible, because e.g. re-verifying large parts of the world is
+always going to take a long time, even if it doesn't take 8 hours.
 
 ## Dealing with PGP
 
 A pure-Rust implementation of PGP is available at https://sequoia-pgp.org. With
 any luck, the vast majority of PGP signatures in the Keybase world will be
-checkable using that library, with decent performance.
+checkable using Sequoia. The benchmarks for verifying PGP signatures above are
+based on this library, and as a proof of concept it works for validating the
+merkle tree root.
 
 For keys or signatures with wacky GnuPG-specific crap in them that fail
-validation in-process, we can shell out to GnuPG itself to validate them in a
-temporary keyring. That's going to be much more expensive, but if the keys/sigs
-in question are a tiny minority, it will be much simpler to shell out than
-trying to implement our own support.
+validation in-process, we can shell out to GnuPG to validate them in a
+temporary keyring (or potentially to Keybase Go code running elsewhere). That's
+going to be much more expensive, but if the keys/sigs in question are a tiny
+minority, it might be much simpler to shell out than to try to support every
+corner case. A likely strategy here will be to attempt validation with Sequoia,
+and when that fails, to automatically make a fallback attempt with GnuPG.
+
+We will probably want to cache signatures in two forms:
+
+- The "raw" tables mentioned above, which include signature in the attached
+  form indexed by seqno.
+- Some "verified" tables which store the extracted plaintext of each signature,
+  representing the fact that the signature was checked already.
+
+The verified tables will represent derived data, but that data is unlikely to
+ever be dropped, because signature verification is very stable. This will
+roughly double the overall storage requirements of the validator however.
+
+One wrinkle for user PGP sigs: The state of the user's sigchain determines what
+`full_hash` version of the key should be used to check a signature. In
+particular, this isn't local to the sigchain link in question; it's a matter of
+looking back in the sigchain. One workaround here could be to store the
+`full_hash` that was used to validate a signature, and to repeat the validation
+later if it ever looks like that `full_hash` that was used in the past doesn't
+match what's needed.
