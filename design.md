@@ -49,15 +49,16 @@ If the validator sees any errors during the root loop, or comes across any
 inconsistent root nodes that claim the same seqno, it fails the client request
 that started it (if any) and all subsequent requests. The request may also fail
 with a "not yet bootstrapped" error if the validator hasn't yet completed its
-first bootstrapping runs through root loop.
+first bootstrapping runs through root loop, to avoid keeping clients waiting
+forever.
 
 ## Caching
 
 All of the above is heavily dependent on local caching to reduce network
 fetches. Every time the word "fetch" occurs above, the assumption is that the
-validator will first check its cache. Past merkle roots roots and interior
-nodes are cached for traversing the tree to collect differences. User keys are
-cached to validate new sigchain links without refetching them.
+validator will first check its cache. Interior nodes from past merkle roots are
+cached for traversing the tree to collect differences. User keys are cached to
+validate new sigchain links without refetching them.
 
 It's possible that we could get away with caching less than everything. For
 example, we don't need the contents of past merkle roots, only their hashes to
@@ -349,11 +350,13 @@ their results. Also this doesn't necessarily need to be part of the MVP.
 
 ## Rough Work Schedule
 
+Here's a made up example schedule for this work:
+
 - Week 1
   - root loop, begin walking roots from seqno 1
   - merkle tree traversals, finding differing nodes between two roots
   - user loop, begin detecting new users and new sigchain links
-  - a test framework for generating fake Merkle histories
+  - a test framework for generating fake users and Merkle histories
 - Week 2
   - GnuPG integration for wacky signatures
   - `full_hash` handling
@@ -363,7 +366,19 @@ their results. Also this doesn't necessarily need to be part of the MVP.
   - failure test cases
   - dump file format
   - keybase.io API endpoint for bulk root fetching
-  - profiling
+  - profiling hotspots
 - Week 4
   - more profiling and optimization
-  - team sigchain integration
+  - dump file generation on keybase.io
+  - team sigchain features
+  - tooling for generating fake test teams
+- Week 5
+  - more profiling and optimization
+  - packaging (systemd unit files, etc.) and documentation
+  - blockchain integration?
+
+The team sigchain features in particular I think are poorly scoped, because I
+don't have a good list in my head of what all we need to enforce. (Max: I'll
+want to sit down with you and make that list if we can.) And it's a pretty
+optimistic schedule overall, without much wiggle room built-in, and we might
+want to add some.
