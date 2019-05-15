@@ -3,10 +3,10 @@
 ## A Sketch of Operation in the Steady State
 
 Here's a rough description of what the validator does in its steady state,
-focusing just on the Merkle roots and on the users tree. The word "fetch" here
-could be interpreted to mean an individual network fetch, however in the
-performance section below we'll discuss how we expect to use batch fetching and
-caching.
+focusing just on the Merkle roots and on the users tree, leaving out teams for
+now. The word "fetch" here could be interpreted to mean an individual network
+fetch, however in the performance section below we'll discuss how we expect to
+use batch fetching and caching.
 
 - Once a minute, or when prompted by a caller, the main loop hits
   `merkle/root.json` and fetches the latest merkle root seqno.
@@ -70,15 +70,15 @@ cache everything:
   for a user. But there's no reason to refetch merkle roots or sigchain links
   in that case, because their contents are immutable. That sort of refetching
   could also become a thundering herd problem, if there are many copies of the
-  validator running in the wild. More on this approach in its own section
-  below.
+  validator running in the wild. More on the topic of blowing away derived data
+  in the section on updates below.
 - Development. Much of development will be repeatedly re-running the validator
   against production Merkle tree data, and gradually encountering all the
   corner cases that have come up over time. Avoiding network fetches during
   this process will be helpful.
 
-The following items will be cached in raw tables, which should never need to be
-modified:
+The following items will be cached in "raw" tables, which should never need to
+be dropped or modified:
 
 - Merkle root sigs, indexed by their seqno.
 - Merkle interior nodes, indexed by their hash.
@@ -120,12 +120,11 @@ https://keyase.io/robots.txt` takes about 100ms.
 
 This lets us make some important back-of-the-envelope estimates about
 performance requirements. The current merkle seqno as of this writing (14 May
-2019) is 5,370,352, with a rate of new roots of about 1 every 10 seconds. If
+2019) is 5,370,352, with a new root published about every 10 seconds. If
 validating every one of those roots requires a single 100ms network fetch and
 nothing else, bootstrapping will take 6 days. If validating every one of those
 roots requires verifying a single PGP signature and nothing else, bootstrapping
-will take 2 hours. However note that with some effort, signature verification
-could be parallelize across many cores; more on parallelism below.
+will take 2 hours.
 
 Choosing a performance target is somewhat arbitrary, but my preference is for
 bootstrapping to finish "overnight", or in at most 8 hours. That works out to
@@ -142,20 +141,50 @@ node present in all of those trees but not in S1." The API server will need to
 add that endpoint.
 
 That endpoint would get rid of the network round trip penalty for fetching
-merkle tree nodes, if the validator fetched them in groups. However, it's
-likely that the keybase.io API server will still pay a MySQL/Aurora round trip
-penalty for each node in assembling the response. I haven't measured Keybase's
-MySQL round trip time, but I expect it to be between 1ms and 10ms. (Max: Do you
-know our median response time?) Even if a MySQL fetch takes only 1ms per merkle
-tree node, we would probably burn up our entire 5ms per-root-node time budget
-just fetching the interior nodes.
+merkle tree nodes. However, it's likely that the keybase.io API server will
+still pay a MySQL/Aurora round trip penalty for each node in assembling the
+response. I haven't measured Keybase's MySQL round trip time, but I expect it
+to be between 1ms and 10ms. (Max: Do you know our median response time?) Even
+if a MySQL fetch takes only 1ms per merkle tree node, we would probably burn up
+our entire 5ms per-root-node time budget just fetching the interior nodes.
 
 So while the batch merkle tree fetching endpoint is an important part of
 reducing overhead in the steady state, it's likely that it won't be fast enough
 to hit our performance target for boostrapping. Instead, Keybase will need to
 publish large dump files containing all the merkle nodes in the world, and the
 validator will need to download and process these files as part of
-bootstrapping. More discussion of this design below in its own section.
+bootstrapping.
+
+## Dump Files
+
+As noted immediately above, bulk dump files will probably be the most important
+step in improving bootstrapping performance. At a minimum, these will need to
+supply all the merkle tree interior nodes in the world. Dumping the interior
+nodes en masse will allow MySQL to execute a giant table scan, avoiding the
+round trip penalties that the Keybase API server pays for tree traversals.
+
+The dump file might also include root nodes, since I'm not sure a bulk root
+node fetching endpoint exists now, but alternatively such an endpoint could be
+added. Likewise the dump file could include user keys and sigs, but the
+existing API endpoints for fetching those in bulk are probably adequate.
+
+The dump file could be regenerated periodically, say once a week. If generation
+puts an unacceptable load on the production DB, it could instead be generated
+from a replica. Only the most recent dump file needs to be kept around on the
+server, so storage requirements don't need to grow quadratically over time.
+Alternatively, the server could generate e.g. one dump file per day, including
+only the interior nodes generated that day, and the client could do a separate
+fetch for each day. (However, I don't think interior nodes record what day they
+were created on, so executing daily dumps without expensive tree traversals
+might require a new index on the server side.)
+
+Ideally neither the database, nor the API server, nor the validator will need
+to keep the entire world of merkle iterior nodes in memory at any point.
+Formatting the whole thing as e.g. a giant JSON list of strings would make that
+trickier than it needs to be, because iterating over a JSON list in a streaming
+fashion is weird. A stream of concatenated JSON objects, or MessagePack
+objects, or something like that would probably be easier to work with. But the
+details aren't super important here.
 
 ## Properties to Validate
 
@@ -270,39 +299,7 @@ store the `full_hash` that was used to validate a signature as a column in the
 verified table, and to repeat the validation later if it ever looks like that
 `full_hash` that was used in the past doesn't match what's expected.
 
-## Dump Files
-
-As noted above in the performance discussion, bulk dump files will probably be
-the most important step in improving bootstrapping performance. At a minimum,
-these will need to supply all the merkle tree interior nodes in the world.
-Dumping the interior nodes as a class will allow MySQL to execute a giant table
-scan, avoiding the round trip penalties that the Keybase API server pays for
-tree traversals.
-
-The dump file might also include root nodes, since I'm not sure a bulk root
-node fetching endpoint exists now, but alternatively such an endpoint could be
-added. Likewise the dump file could include user keys and sigs, but the
-existing API endpoints for fetching those in bulk are probably adequate.
-
-The dump file could be regenerated periodically, say once a week. If the query
-turns out to put an unacceptable load on the production DB, it could instead be
-generated from a replica. Only the most recent dump file needs to be kept
-around on the server, so storage requirements don't need to grow quadratically
-over time. Alternatively, the server could generate e.g. one dump file per day,
-including only the interior nodes generated that day, and the client could do a
-separate fetch for each day. (However, I don't think interior nodes record what
-day they were created on, so executing daily dumps without an expensive tree
-traversal might require some new indexes on the server side.)
-
-Ideally neither the database, nor the API server, nor the validator will need
-to keep the entire world of merkle iterior nodes in memory at any point.
-Formatting the whole thing as e.g. a giant JSON list of strings would make that
-tricky, because iterating over a JSON list in a streaming fashion is
-troublesome. A series of concatenated JSON blobs, or MessagePack blobs, or
-something like that would probably be easier to work with. But the details
-aren't super important here.
-
-## Parallelism
+## Parallelism (or lack thereof)
 
 The initial implementation of the validator will be single-threaded, and
 runtime is going to be dominated by IO in many cases. However, there are
@@ -349,3 +346,24 @@ record a conflict) based on what it finds.
 Rather than taking on the complexity of a local bitcoin node, it probably makes
 the most sense to query a handful of blockchain explorers and just cross-check
 their results. Also this doesn't necessarily need to be part of the MVP.
+
+## Rough Work Schedule
+
+- Week 1
+  - root loop, begin walking roots from seqno 1
+  - merkle tree traversals, finding differing nodes between two roots
+  - user loop, begin detecting new users and new sigchain links
+  - a test framework for generating fake Merkle histories
+- Week 2
+  - GnuPG integration for wacky signatures
+  - `full_hash` handling
+  - merkle skip pointers
+  - UID and KID uniqueness
+- Week 3
+  - failure test cases
+  - dump file format
+  - keybase.io API endpoint for bulk root fetching
+  - profiling
+- Week 4
+  - more profiling and optimization
+  - team sigchain integration
