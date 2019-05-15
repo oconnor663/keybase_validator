@@ -3,50 +3,53 @@
 ## A Sketch of Operation in the Steady State
 
 Here's a rough description of what the validator does in its steady state,
-focusing just on the Merkle roots and on the users tree. The word "fetch" below
+focusing just on the Merkle roots and on the users tree. The word "fetch" here
 could be interpreted to mean an individual network fetch, however in the
 performance section below we'll discuss how we expect to use batch fetching and
-caching to hit our performance target.
+caching.
 
-- Once a minute, the main loop hits `merkle/root.json` and fetches the latest
-  merkle root seqno.
-- The **root loop**. For each seqno between the last one verified and the new
-  one:
-  - Fetch the root node at this seqno.
-  - Verify that it's signed correctly, contains the correct seqno, contains
-    the correct prev pointers, etc.
-  - Recusviely fetch and walk the interior merkle tree nodes under this root,
+- Once a minute, or when prompted by a caller, the main loop hits
+  `merkle/root.json` and fetches the latest merkle root seqno.
+- The **root loop**. For each seqno between the most recent one previously
+  verified and this new one:
+  - Fetch the root node at that seqno.
+  - Verify that it's signed correctly by the root key, contains the correct
+    seqno, contains the correct prev pointers, etc.
+  - Recursively fetch and walk the interior merkle tree nodes under this root,
     finding all the user leaves that differ from the previous verified root.
   - The **user loop**. For each user that was updated, for each sigchain seqno
-    between the last verified for that user and the new one:
+    between the most recent verified one for that user and this new one:
     - Fetch the sigchain link at that seqno.
-    - If needed, fetch keys for the user. Note that "needed" is hard to
+    - If needed, fetch keys for the user. Note that "needed" is tricky to
       determine prior to the introduction of the PGP `full_hash` field in the
       sigchain, but we might be able to assume that all new PGP keys from this
       point forward will include that field, and only re-fetch keys when we
       encounter a new `full_hash`.
-    - Verify that it's signed correctly, contains the correct seqno, contains
-      the correct prev pointers, etc.
+    - Verify that it's signed correctly by an active sibkey, contains the
+      correct seqno, contains the correct prev pointers, etc.
+    - Update the user's set of active sibkeys if necessary.
 
-When all of this completes, every new merkle root has been incorporated into
-the local tree, and every user update has been verified. If any step fails
-verification, the process flips into a global failure state, from which it
-doesn't attempt to recover.
+When all of those nested loops complete, every new merkle root has been
+incorporated into the local tree, and every user update has been verified. If
+any step fails verification, the process flips into a global failure state,
+from which it doesn't attempt to recover.
 
 In this design, the API of the validator is a single REST endpoint. Clients
 query the validator by sending along the last signed merkle root they saw from
-keybase.io. If the root they send has a valid signature, and the validator
-hasn't yet seen it, this will kick off a run of the root loop to catch up and
-wait for it to complete. The validator will also record every signed merkle
-root that it encounters, and any inconsistencies will lead to another permanent
-failure state, making these requests a sort of gossip protocol about what each
-client is seeing. After the root loop catches up to the request, if everything
-went smoothly, the API call returns success.
+keybase.io. The validator checks signatures on what the client sent and
+immediately records it (or confirms that it matches an existing known root with
+that seqno). This constitutes a sort of gossip protocol between clients and the
+validator, to try to catch any inconsistencies in what keybase.io is reporting.
+If the submitted root is newer than what the validator has seen, it immediately
+kicks off a new run of the root loop to catch up, and waits for that loop to
+complete before responding to the client. After the root loop catches up, if
+everything went smoothly, the API call returns success.
 
-If the validator sees any errors during the root loop, it fails the client
-request that started it (if any) and all subsequent requests. The request may
-also fail with a "not yet bootstrapped" error if the validator hasn't yet
-completed its first bootstrapping runs through root loop.
+If the validator sees any errors during the root loop, or comes across any
+inconsistent root nodes that claim the same seqno, it fails the client request
+that started it (if any) and all subsequent requests. The request may also fail
+with a "not yet bootstrapped" error if the validator hasn't yet completed its
+first bootstrapping runs through root loop.
 
 ## Caching
 
@@ -338,13 +341,11 @@ implementation of the validator running under a profiler.
 
 ## Blockchain
 
-- naive loop
-- list of exact things to be verified
-- bootstrapping optimizations
-- updates (throwing away some caches, feature flags)
-- blockchain integration
-- team tree verification
-- parallelism optimizations
-- in-the-hot-path queries
-- contract estimates
-- dump files
+Publication to the blockchain happens only once every 12 hours, so it can only
+be a lagging indicator of inconsistency in the tree. But the validator could
+periodically check what's in the blockchain and kick off a root loop run (or
+record a conflict) based on what it finds.
+
+Rather than taking on the complexity of a local bitcoin node, it probably makes
+the most sense to query a handful of blockchain explorers and just cross-check
+their results. Also this doesn't necessarily need to be part of the MVP.
