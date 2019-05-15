@@ -301,7 +301,40 @@ aren't super important here.
 
 ## Parallelism
 
-The initial implementation of the validator will be single-threaded, and runtime is going to be dominated by IO at first.
+The initial implementation of the validator will be single-threaded, and
+runtime is going to be dominated by IO in many cases. However, there are
+exceptions:
+
+- Re-validating the world after a version update / developer change might not
+  need to do any network IO.
+- If each merkle root seqno requires 100 KB of data (hopefully an
+  overestimate), a 1 GB/s connection e.g. inside of AWS could download the
+  entire world in a dump file in about 10 minutes.
+
+In those case, the bootstrapping time will be dominated by either disk or CPU.
+It might then make sense to try to parallelize across threads, to spread out
+the CPU work of verifying signatures. If we do this, it'll be important to
+avoid having multiple threads writing to disk at once; SQLite has a global
+write lock, and having multiple threads contend for it will just slow things
+down.
+
+The central challenge in parallelizing any of this is that walking time forward
+is inherently serial. For example, if merkle root number 1 modifies user A, and
+root number 2 also touches A, the processing of root 2 must take into account
+the result of root 1. (Did it add a sibkey? Remove one? Change the `full_hash`
+of a PGP key? Etc.) Furthermore, if root 3 modifies A too, root 2 must *not*
+see the result of root 3. The validator only maintains one answer for the
+"current state of user A"; it's not going to bookkeep a separate snapshot of A
+associated with each merkle root. So any attempt to parallelize verification
+must preserve the serial nature of all this.
+
+There are fancy strategies that can work around this. We could try to detect
+when roots are independent from each other, and parallelize them only in that
+case. We could even take a page out of Intel's book and try to detect
+serialization violations after the fact, assuming they'll be rare and rewinding
+processing to correct them when they come up. But all of these strategies are
+complicated, and I don't plan to attempt any of them until I have a working
+implementation of the validator running under a profiler.
 
 ## Blockchain
 
